@@ -1,0 +1,336 @@
+#!/usr/bin/env bash
+#
+# Summary: Install a Ruby version using ruby-install
+#
+# Usage: rbenv rbinstall [-f|-s] [-kpv] <version> [-- <configure-opts...>]
+#        rbenv rbinstall --list
+#        rbenv rbinstall --version
+#
+#   -l, --list           List latest stable versions for each Ruby
+#   -L, -U, --update     Downloads the latest ruby versions and checksums
+#   -f, --force          Allow overwriting an existing installed version
+#   -k, --keep           Keep source tree in RBENV_BUILD_ROOT (or RUBY_INSTALL_SRC_DIR) after installation
+#       --no-cleanup     alias for --keep
+#                        (defaults to "RBENV_ROOT/sources")
+#   -s, --skip-existing  Avoid overwriting an existing installed version
+#       --no-reinstall   alias for --skip-existing
+#   -v, --verbose        Verbose mode: forward all build output to stdout/stderr #TODO quiet by default somehow
+#   -V, --version        Show version of ruby-install
+#
+#   ruby-install passthrough options:
+#
+#   --src-dir DIR        Specifies the directory for downloading and unpacking Ruby source.
+#                        (note: `-s` shortflag is for `skip-existing`)
+#
+#                        If src-dir is given directly, it falls back to (in order):
+#                        - RUBY_INSTALL_SRC_DIR
+#                        - RBENV_BUILD_ROOT
+#                        - $(rbenv root)/sources
+#
+#   -D, --debug          Enable debugging messages.
+#   -j, --jobs NUM       Specifies the number of make jobs to run in parallel when compiling Ruby. If the -j option is provided without an argument, make will allow an unlimited number of simultaneous jobs.
+#   -M, --mirror URL     Specifies an alternate mirror to download the Ruby archive from.
+#   -p, --patch          Apply a patch from stdin before building
+#   -u, --url URL        Alternate URL to download the Ruby archive from.
+#   -m, --md5 MD5        Specifies the MD5 checksum for the Ruby archive.
+#   --sha1 SHA1          Specifies the SHA1 checksum for the Ruby archive.
+#   --sha256 SHA256      Specifies the SHA256 checksum for the Ruby archive.
+#   --sha512 SHA512      Specifies the SHA512 checksum for the Ruby archive.
+#   --package-manager PM Use an alternative package manager. [apt|dnf|yum|pacman|zypper|brew|pkg|port]
+#
+#   non-options:
+#
+#   -r, --rubies-dir     Specifies the alternate directory where other Ruby directories are installed, such as ~/.rvm/rubies or ~/.rbenv/versions. Defaults to /opt/rubies for root and ~/.rubies for normal users.
+#                        Not configurable. Always installs to $(rbenv root)
+#
+#   -i, --install-dir    Specifies the directory where Ruby will be installed. Defaults to /opt/rubies/$ruby-$version for root and ~/.rubies/$ruby-$version for normal users.
+#   --prefix DIR         Alias for -i DIR.
+#   --system             Alias for -i /usr/local.
+#                        Not configurable. Always installs to $(rbenv root)/<version name>
+#
+#   -c, --cleanup        Remove the downloaded Ruby archive and unpacked source-code after installation.
+#                        Defaults to true. Disable with -k, --keep, --no-cleanup
+
+# For detailed information on installing Ruby versions with ruby-build,
+# including a list of environment variables for adjusting compilation,
+# see: https://github.com/rbenv/ruby-build#usage
+#
+# -p, --patch FILE Specifies any additional patches to apply.
+# --no-download Use the previously downloaded Ruby archive.
+# --no-verify Do not verify the downloaded Ruby archive.
+# --no-extract Do not extract the downloaded Ruby archive. Implies --no-download and --no-verify.
+# --no-install-deps Do not install build dependencies before installing Ruby.
+
+set -e
+[ -n "$RBENV_DEBUG" ] && set -x
+
+# Load shared library functions
+eval "$(ruby-build --lib)"
+
+usage() {
+  rbenv-help install 2>/dev/null
+  [ -z "$1" ] || exit "$1"
+}
+
+suggest_selecting_global() {
+  # shellcheck disable=SC2155
+  local version_file="$(rbenv-version-file)"
+  [[ "$version_file" != "$RBENV_ROOT"/version || -e "$version_file" ]] && return 0
+  echo
+  colorize 1 "NOTE:"
+  echo -n " to activate this Ruby version as the new default, run: "
+  colorize 33 "rbenv global $VERSION_NAME"
+  echo
+}
+
+colorize() {
+  if [ -z "$NO_COLOR" ] && [ -t 1 ]; then printf "\e[%sm%s\e[m" "$1" "$2"
+  else printf "%s" "$2"
+  fi
+}
+
+build_failed() {
+  { echo
+    colorize '31;1' "BUILD FAILED"
+    echo
+
+    # if ! rmdir "${BUILD_PATH}" 2>/dev/null; then
+    #   echo "You can inspect the build directory at ${BUILD_PATH}"
+
+      if [ -n "$(head -1 "$LOG_PATH" 2>/dev/null)" ]; then
+        colorize 33 "See the full build log at ${LOG_PATH}"
+        printf "\n"
+      fi
+    # fi
+  } >&3
+  exit 1
+}
+
+# Log the full invocation of an external command and capture its output.
+capture_command() {
+  local msg
+  msg="->$(printf ' %s\n' "$@")"
+
+  colorize 36 "$msg"
+  echo
+
+  # In verbose mode, connect the subcommand to original stdout & stderr.
+  local cmd_stdout=1
+  local cmd_stderr=3
+  if [ -z "$VERBOSE" ]; then
+    printf "%s\n" "$msg" >&4
+    # In normal mode, redirect all subcommand output to LOG_PATH.
+    cmd_stdout=4
+    cmd_stderr=4
+  fi
+
+  local status=0
+  # shellcheck disable=SC2261
+  "$@" 2>&$cmd_stderr >&$cmd_stdout || status="$?"
+  if [ "$status" -ne 0 ]; then
+    echo "external command failed with status $status" >&4
+  fi
+  return "$status"
+}
+
+indent() {
+  sed 's/^/  /'
+}
+
+optarg() {
+  local arg=${option#*=} # truncate up to and including '='
+  if [ -n "$arg" ] && [ "$arg" != "$option" ]; then
+    # the argument was part of the 'option' string
+    echo "$arg"
+  else # otherwise, get arg from ARGUMENTS and signal for it to be shifted
+    echo "${ARGUMENTS[0]}"
+    return 1
+  fi
+}
+
+unset DEBUG
+unset FORCE
+unset SKIP_EXISTING
+unset VERBOSE
+unset HAS_PATCH
+unset SRC_DIR
+CLEANUP=true
+RUBY_INSTALL_ARGS=()
+
+parse_options "$@"
+
+for option in "${OPTIONS[@]}"; do
+  unset shiftarg
+
+  case "$option" in
+  # early exits
+  "l" | "list" )         exec ruby-install ;;
+  "L" | "U" | "update" ) exec ruby-install --update ;;
+  "V" | "version" )      exec ruby-install --version ;;
+
+  # flags
+  "f" | "force" ) FORCE=true ;;
+  "k" | "keep" | "no-cleanup" ) unset CLEANUP ;;
+  "s" | "skip-existing" | "no-reinstall" ) SKIP_EXISTING=true ;;
+  "v" | "verbose" ) VERBOSE=true ;;
+
+  "src-dir" | "src-dir="* )
+    SRC_DIR=$(optarg) || shiftarg=1 ;;
+
+  # passthrough options
+  "D" | "debug" ) RUBY_INSTALL_ARGS+=(--debug) ;;
+  "j" | "jobs" | "jobs="* ) RUBY_INSTALL_ARGS+=(--jobs "$(optarg)") || shiftarg=1 ;;
+  "p" | "patch" ) RUBY_INSTALL_ARGS+=(--patch "$(optarg)") || shiftarg=1 ;;
+  "u" | "url" | "url="* ) RUBY_INSTALL_ARGS+=(--url "$(optarg)") || shiftarg=1 ;;
+  "M" | "mirror" | "mirror="* ) RUBY_INSTALL_ARGS+=(--mirror "$(optarg)") || shiftarg=1 ;;
+  "m" | "md5" | "md5="* ) RUBY_INSTALL_ARGS+=(--md5 "$(optarg)") || shiftarg=1 ;;
+  "sha1" | "sha1="* ) RUBY_INSTALL_ARGS+=(--sha1 "$(optarg)") || shiftarg=1 ;;
+  "sha256" | "sha256="* ) RUBY_INSTALL_ARGS+=(--sha256 "$(optarg)") || shiftarg=1 ;;
+  "sha512" | "sha512="* ) RUBY_INSTALL_ARGS+=(--sha512 "$(optarg)") || shiftarg=1 ;;
+  "package-manager" | "package-manager="* ) RUBY_INSTALL_ARGS+=(--package-manager "$(optarg)") || shiftarg=1 ;;
+
+  "h" | "help" ) usage 0 ;;
+  * ) usage 1 >&2 ;;
+  esac
+
+  if [ -n "$shiftarg" ]; then
+    ARGUMENTS=("${ARGUMENTS[@]:1}")
+  fi
+done
+
+TMP=${TMPDIR:-/tmp}
+TMP="${TMP%/}"
+LOG_PATH="${TMP}/rbenv-rbinstall.$(date "+%Y%m%d%H%M%S").$$.log"
+
+# Some functions need to be able to write to the original process stderr
+# stream, since fd 2 would often have been redirected elsewhere. To enable
+# this, ruby-build initializes two additional file descriptors:
+#
+#  3: the original stderr
+#  4: the log file
+exec 3<&2
+if [ -n "$VERBOSE" ]; then exec 4<&1 # open the original stdout at fd 4
+else exec 4<> "$LOG_PATH" # open the log file at fd 4
+fi
+
+#TODO does this prevent `rbenv install` from deriving by rbenv-local ?
+[ "${#ARGUMENTS[@]}" -le 1 ] || usage 1 >&2
+
+unset VERSION_NAME
+
+# The first argument contains the version to install. If the
+# argument is missing, try to install whatever local app-specific
+# version is specified by rbenv. Show usage instructions if a local
+# version is not specified.
+DEFINITION="${ARGUMENTS[0]}"
+[ -n "$DEFINITION" ] || DEFINITION="$(rbenv-local 2>/dev/null || true)"
+[ -n "$DEFINITION" ] || usage 1 >&2
+
+# Define `before_install` and `after_install` functions that allow
+# plugin hooks to register a string of code for execution before or
+# after the installation process.
+declare -a before_hooks after_hooks
+
+# shellcheck disable=SC2317
+before_install() {
+  local hook="$1"
+  before_hooks["${#before_hooks[@]}"]="$hook"
+}
+
+# shellcheck disable=SC2317
+after_install() {
+  local hook="$1"
+  after_hooks["${#after_hooks[@]}"]="$hook"
+}
+
+IFS=$'\n' read -d '' -r -a scripts <<<"$(rbenv-hooks install)" || true
+# shellcheck disable=SC1090
+for script in "${scripts[@]}"; do source "$script"; done
+
+# Set VERSION_NAME from $DEFINITION, if it is not already set. Then
+# compute the installation prefix.
+[ -n "$VERSION_NAME" ] || VERSION_NAME="${DEFINITION##*/}"
+PREFIX="${RBENV_ROOT}/versions/${VERSION_NAME}"
+
+[ -d "${PREFIX}" ] && PREFIX_EXISTS=1
+
+# If the installation prefix exists, prompt for confirmation unless
+# the --force option was specified.
+if [ -d "${PREFIX}/bin" ]; then
+  if [ -z "$FORCE" ] && [ -z "$SKIP_EXISTING" ]; then
+    echo "rbenv: $PREFIX already exists" >&2
+    if [ ! -t 0 ]; then
+      echo "rbenv: must use \`--force' or \`--skip-existing' in non-interactive mode" >&2
+      exit 1
+    fi
+    read -rp "continue with installation? (y/N) "
+
+    case "$REPLY" in
+    y* | Y* ) ;;
+    * ) exit 1 ;;
+    esac
+  elif [ -n "$SKIP_EXISTING" ]; then
+    # Since we know the ruby version is already installed, and are opting to
+    # not force installation of existing versions, we just `exit 0` here to
+    # leave things happy
+    exit 0
+    #TODO maybe print the same message that ruby-install --no-reinstall prints?
+  fi
+fi
+
+# If RBENV_BUILD_ROOT (or its ruby-install equivalent) is set, don't cleanup
+if [ -n "$RBENV_BUILD_ROOT" ] || [ -n "$RUBY_INSTALL_SRC_DIR" ]; then
+  unset CLEANUP
+fi
+
+# Default SRC_DIR to (in order):
+# RUBY_INSTALL_SRC_DIR or RBENV_BUILD_ROOT or $RBENV_ROOT/sources
+: "${SRC_DIR:=${RUBY_INSTALL_SRC_DIR:-${RBENV_BUILD_ROOT:-${RBENV_ROOT}/sources}}}"
+
+# TODO ?
+# # Set RUBY_BUILD_CACHE_PATH to $RBENV_ROOT/cache, if the directory
+# # exists and the variable is not already set.
+# if [ -z "${RUBY_BUILD_CACHE_PATH}" ] && [ -d "${RBENV_ROOT}/cache" ]; then
+#   export RUBY_BUILD_CACHE_PATH="${RBENV_ROOT}/cache"
+# fi
+
+# Default RBENV_VERSION to the globally-specified Ruby version.
+# shellcheck disable=SC2155
+export RBENV_VERSION="$(rbenv-global 2>/dev/null || true)"
+
+# Execute `before_install` hooks.
+for hook in "${before_hooks[@]}"; do eval "$hook"; done
+
+# Plan cleanup on unsuccessful installation.
+cleanup() {
+  [ -z "${PREFIX_EXISTS}" ] && rm -rf "$PREFIX"
+}
+
+trap cleanup SIGINT
+
+build_args=(
+${CLEANUP:+--cleanup}
+${HAS_PATCH:+--patch}
+--src-dir "$SRC_DIR"
+--prefix "$PREFIX"
+"${RUBY_INSTALL_ARGS[@]}"
+"$DEFINITION"
+-- "${EXTRA_ARGUMENTS[@]}")
+
+# Invoke `ruby-install` and record the exit status in $STATUS.
+STATUS=0
+capture_command ruby-install "${build_args[@]}" || STATUS="$?"
+
+# Execute `after_install` hooks.
+for hook in "${after_hooks[@]}"; do eval "$hook"; done
+
+# Run `rbenv-rehash` after a successful installation.
+if [ "$STATUS" == "0" ]; then
+  rbenv-rehash
+  suggest_selecting_global
+else
+  cleanup
+  build_failed
+fi
+
+exit "$STATUS"
